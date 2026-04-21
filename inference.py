@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import ffmpeg
 
-from sam3.model_builder import build_sam3_video_model, build_sam3_video_predictor
+from sam3.model_builder import build_sam3_video_model
 
 MAX_DISPLAY_W = 1280
 MAX_DISPLAY_H = 720
@@ -39,11 +39,10 @@ def open_video(path: str):
 
 
 def collect_click(frame: np.ndarray, native_w: int, native_h: int):
-    """Show first frame, let user click + confirm. Returns native (x, y) or None."""
+    """Show frame, let user click + confirm. Returns native (x, y) or None."""
     scale = min(MAX_DISPLAY_W / native_w, MAX_DISPLAY_H / native_h, 1.0)
     disp_w, disp_h = int(native_w * scale), int(native_h * scale)
     base = cv2.resize(frame, (disp_w, disp_h))
-
     state = {"pt": None}
 
     def on_mouse(event, x, y, flags, param):
@@ -67,10 +66,8 @@ def collect_click(frame: np.ndarray, native_w: int, native_h: int):
             break
 
     cv2.destroyAllWindows()
-
     if not confirmed:
         return None
-
     cx, cy = state["pt"]
     return cx / scale, cy / scale  # scale back to native coords
 
@@ -85,25 +82,30 @@ def load_predictor(weights_dir: Path, device: str):
         )
     ckpt = str(checkpoints[0])
     print(f"Loading weights: {ckpt}")
+    bpe_path = str(
+        Path(__file__).parent / "sam3" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+    )
     model = build_sam3_video_model(
         checkpoint_path=ckpt,
         load_from_HF=False,
+        bpe_path=bpe_path,
         device=device,
     )
-    return build_sam3_video_predictor(model=model)
+    # The SAM2-compatible tracker API is on model.tracker;
+    # it needs the detector backbone for visual feature extraction.
+    predictor = model.tracker
+    predictor.backbone = model.detector.backbone
+    return predictor
 
 
-def extract_mask(outputs: dict) -> np.ndarray | None:
-    """Extract (H, W) bool mask from a SAM3 outputs dict. Returns None on empty."""
-    if outputs is None:
+def extract_mask(video_res_masks, idx: int = 0) -> np.ndarray | None:
+    """Return (H, W) bool numpy mask for object at index idx, or None."""
+    if video_res_masks is None or len(video_res_masks) <= idx:
         return None
-    masks = outputs.get("masks")
-    if masks is None or masks.numel() == 0:
-        return None
-    m = masks[0]           # first object
-    if m.dim() == 3:       # (1, H, W) → (H, W)
+    m = (video_res_masks[idx] > 0.0).cpu().numpy()
+    if m.ndim == 3:   # (1, H, W) → (H, W)
         m = m[0]
-    return (m > 0).cpu().numpy().astype(bool)
+    return m.astype(bool)
 
 
 def composite(frame: np.ndarray, mask: np.ndarray | None, bg_value: int) -> np.ndarray:
@@ -154,12 +156,14 @@ def main():
     bg_value = 255 if args.bg_color == "white" else 0
 
     cap, native_fps, width, height, total_frames = open_video(args.video_path)
-    ret, first_frame = cap.read()
+    prompt_frame_idx = round(native_fps)  # 1 second in
+    cap.set(cv2.CAP_PROP_POS_FRAMES, prompt_frame_idx)
+    ret, prompt_frame = cap.read()
     cap.release()
     if not ret:
-        sys.exit("Error: Could not read first frame.")
+        sys.exit("Error: Could not read frame at 1 second.")
 
-    click = collect_click(first_frame, width, height)
+    click = collect_click(prompt_frame, width, height)
     if click is None:
         print("Cancelled.")
         sys.exit(0)
@@ -168,32 +172,67 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
+    if device == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     weights_dir = Path(__file__).parent / "weights"
     predictor = load_predictor(weights_dir, device)
 
     out_fps = args.fps if (args.fps and args.fps < native_fps) else native_fps
     frame_step = round(native_fps / out_fps) if out_fps < native_fps else 1
 
-    # Start SAM3 session
-    resp = predictor.handle_request(
-        request=dict(type="start_session", resource_path=args.video_path)
-    )
-    session_id = resp["session_id"]
-
-    # Normalize click coords to [0, 1] as required by SAM3
+    # Normalize click coords to [0, 1] as required by SAM3 tracker
     pts = torch.tensor([[native_x / width, native_y / height]], dtype=torch.float32)
     lbl = torch.tensor([1], dtype=torch.int32)  # 1 = foreground click
 
-    predictor.handle_request(
-        request=dict(
-            type="add_prompt",
-            session_id=session_id,
-            frame_index=0,
-            points=pts,
-            point_labels=lbl,
-            obj_id=0,
-        )
+    inference_state = predictor.init_state(video_path=args.video_path)
+    predictor.clear_all_points_in_video(inference_state)
+
+    predictor.add_new_points(
+        inference_state=inference_state,
+        frame_idx=prompt_frame_idx,
+        obj_id=1,
+        points=pts,
+        labels=lbl,
+        clear_old_points=False,
     )
+
+    # Collect all masks: forward from prompt frame, then backward to frame 0
+    masks_by_frame: dict[int, np.ndarray] = {}
+
+    print(f"Propagating forward from frame {prompt_frame_idx}...")
+    for f_idx, obj_ids, _, video_res_masks, _ in predictor.propagate_in_video(
+        inference_state,
+        start_frame_idx=prompt_frame_idx,
+        max_frame_num_to_track=total_frames - prompt_frame_idx,
+        reverse=False,
+        propagate_preflight=True,
+    ):
+        if len(obj_ids) > 0:
+            mask = extract_mask(video_res_masks, idx=0)
+            if mask is not None:
+                masks_by_frame[f_idx] = mask
+        if f_idx % 100 == 0:
+            print(f"  Frame {f_idx} / {total_frames}")
+
+    if prompt_frame_idx > 0:
+        print(f"Propagating backward from frame {prompt_frame_idx - 1}...")
+        for f_idx, obj_ids, _, video_res_masks, _ in predictor.propagate_in_video(
+            inference_state,
+            start_frame_idx=prompt_frame_idx - 1,
+            max_frame_num_to_track=prompt_frame_idx,
+            reverse=True,
+            propagate_preflight=True,
+        ):
+            if len(obj_ids) > 0:
+                mask = extract_mask(video_res_masks, idx=0)
+                if mask is not None:
+                    masks_by_frame[f_idx] = mask
+            if f_idx % 100 == 0:
+                print(f"  Frame {f_idx} / {total_frames}")
+
+    print(f"Collected masks for {len(masks_by_frame)} / {total_frames} frames.")
 
     # Pipe composited frames to ffmpeg
     ffmpeg_proc = (
@@ -206,41 +245,22 @@ def main():
     )
 
     cap = cv2.VideoCapture(args.video_path)
-    cap_idx = -1
     written = 0
-    frame = None
-
-    print("Propagating masks and compositing frames...")
-    for response in predictor.handle_stream_request(
-        request=dict(type="propagate_in_video", session_id=session_id)
-    ):
-        f_idx = response["frame_index"]
-
-        # Advance OpenCV capture to this frame (assumes sequential SAM3 output)
-        while cap_idx < f_idx:
-            ret, frame = cap.read()
-            cap_idx += 1
-            if not ret:
-                break
-
-        if not ret or frame is None:
+    print("Compositing and writing output...")
+    for f_idx in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
             break
-
         if frame_step > 1 and f_idx % frame_step != 0:
             continue
-
-        mask = extract_mask(response.get("outputs"))
+        mask = masks_by_frame.get(f_idx)
         out_frame = composite(frame, mask, bg_value)
         ffmpeg_proc.stdin.write(out_frame.tobytes())
         written += 1
 
-        if f_idx % 100 == 0:
-            print(f"  Frame {f_idx} / {total_frames}")
-
     cap.release()
     ffmpeg_proc.stdin.close()
     ffmpeg_proc.wait()
-    predictor.handle_request(request=dict(type="close_session", session_id=session_id))
 
     print(f"Composited {written} frames. Merging audio...")
     merge_audio(tmp_file, args.video_path, output_file)

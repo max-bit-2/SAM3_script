@@ -9,4 +9,4 @@ outputs/
 dist/
 build/
 .pytest_cache/
-*.tmp.mp4
+*.mp4

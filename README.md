@@ -43,7 +43,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ### 5. Install dependencies
 
 ```bash
-pip install -r sam3/requirements.txt
+pip install -e ./sam3
 pip install opencv-python ffmpeg-python
 ```
 
