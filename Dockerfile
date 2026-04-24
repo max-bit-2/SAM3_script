@@ -9,12 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY project_requirements.txt .
-RUN pip install --no-cache-dir -r project_requirements.txt
-
 COPY . .
 
-# weights/ is mounted at runtime — do not bake into the image
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu128 && \
+    pip install --no-cache-dir -e ./sam3 -r project_requirements.txt
+
+# weights/ is mounted at runtime - do not bake into the image
 VOLUME ["/app/weights"]
 
 ENTRYPOINT ["python", "inference.py"]
